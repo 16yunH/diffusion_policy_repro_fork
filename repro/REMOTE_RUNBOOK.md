@@ -138,3 +138,26 @@ The 8x RTX 4090 server is useful after this first checkpoint-eval milestone:
   training logs and eval videos look stable.
 - Keep pretrained eval artifacts separate from training artifacts, for example
   `data/eval/...` versus `data/outputs/...`.
+
+On the shared server, if GPUs 1, 3, and 4 are idle, launch three independent
+Push-T image training runs with:
+
+```bash
+conda activate robodiff
+GPUS=1,3,4 SEEDS=42,43,44 bash repro/launch_pusht_image_train3.sh
+```
+
+For a short smoke test first:
+
+```bash
+SMOKE=1 GPUS=1 SEEDS=42 bash repro/launch_pusht_image_train3.sh
+```
+
+Monitor:
+
+```bash
+tmux ls
+tmux attach -t dp_pusht_s42
+tail -f data/outputs/pusht_image_train3_*/seed_42/train.log
+python repro/summarize_pusht_train_runs.py data/outputs/pusht_image_train3_*
+```
