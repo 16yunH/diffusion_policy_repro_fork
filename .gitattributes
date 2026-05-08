@@ -1,0 +1,4 @@
+repro/*.sh text eol=lf
+repro/*.py text eol=lf
+repro/*.md text eol=lf
+repro/*.ps1 text eol=crlf
