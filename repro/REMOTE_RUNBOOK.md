@@ -47,6 +47,16 @@ SKIP_ENV=1 bash repro/run_pusht_image_pretrained_eval.sh
 FORCE_DOWNLOAD=1 bash repro/run_pusht_image_pretrained_eval.sh
 ```
 
+On a shared 8x RTX 4090 server where only physical GPU 5 is idle and the user
+has no sudo rights, use:
+
+```bash
+SKIP_APT=1 CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 bash repro/run_pusht_image_pretrained_eval.sh
+```
+
+With `CUDA_VISIBLE_DEVICES=5`, the process sees physical GPU 5 as logical
+`cuda:0`, so keep `DEVICE=cuda:0`.
+
 For the initial reproduction, do not launch eight copies at once. First complete
 one clean eval and verify `eval_log.json`, videos, and the summary. After that,
 the same checkpoint eval can be repeated on other GPUs for environment
@@ -73,7 +83,52 @@ The summary script compares `eval_log.json` key `test/mean_score` against the
 `0.884` value encoded in the checkpoint filename with a default tolerance of
 `0.05`.
 
-## 5. Later multi-GPU extension
+## 5. Conda metadata is slow or stuck
+
+If environment creation stalls at `Collecting package metadata`, stop it with
+`Ctrl+C` and configure a user-level conda mirror. This does not need sudo:
+
+```bash
+cat > ~/.condarc <<'EOF'
+channels:
+  - pytorch
+  - pytorch3d
+  - nvidia
+  - conda-forge
+  - defaults
+show_channel_urls: true
+channel_priority: flexible
+remote_connect_timeout_secs: 20
+remote_read_timeout_secs: 120
+repodata_fns:
+  - current_repodata.json
+  - repodata.json
+default_channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
+custom_channels:
+  conda-forge: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  pytorch: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+  nvidia: https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud
+EOF
+
+conda clean -i -y
+```
+
+Then retry:
+
+```bash
+SKIP_APT=1 CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 bash repro/run_pusht_image_pretrained_eval.sh
+```
+
+If the environment already exists after a partial install, skip creation and run
+the remaining steps with:
+
+```bash
+SKIP_APT=1 SKIP_ENV=1 CUDA_VISIBLE_DEVICES=5 DEVICE=cuda:0 bash repro/run_pusht_image_pretrained_eval.sh
+```
+
+## 6. Later multi-GPU extension
 
 The 8x RTX 4090 server is useful after this first checkpoint-eval milestone:
 
