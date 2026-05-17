@@ -161,3 +161,26 @@ tmux attach -t dp_pusht_s42
 tail -f data/outputs/pusht_image_train3_*/seed_42/train.log
 python repro/summarize_pusht_train_runs.py data/outputs/pusht_image_train3_*
 ```
+
+If the goal is to finish one seed first, run a single training process on one
+idle physical GPU. The script below defaults to seed 42 on GPU 1 and will resume
+from the newest existing `seed_42/checkpoints/latest.ckpt` if one exists:
+
+```bash
+conda activate robodiff
+GPU=1 SEED=42 bash repro/launch_pusht_image_single_seed.sh
+```
+
+If GPU 1 becomes busy, use another idle GPU, for example:
+
+```bash
+GPU=5 SEED=42 bash repro/launch_pusht_image_single_seed.sh
+```
+
+Monitor:
+
+```bash
+tmux attach -t dp_pusht_single_s42
+tail -f data/outputs/pusht_image_train3_*/seed_42/train.log
+python repro/summarize_pusht_train_runs.py data/outputs/pusht_image_train3_*
+```
