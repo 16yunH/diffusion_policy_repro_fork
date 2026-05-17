@@ -11,6 +11,7 @@ RUN_ROOT="${RUN_ROOT:-data/outputs/pusht_image_train3_$(date +%Y%m%d_%H%M%S)}"
 CONFIG_PATH="${CONFIG_PATH:-image_pusht_diffusion_policy_cnn.yaml}"
 DATA_URL="${DATA_URL:-https://diffusion-policy.cs.columbia.edu/data/training/pusht.zip}"
 SMOKE="${SMOKE:-0}"
+AUTO_RESUME="${AUTO_RESUME:-1}"
 
 IFS=',' read -r -a SEEDS <<< "${SEEDS_CSV}"
 IFS=',' read -r -a GPUS <<< "${GPUS_CSV}"
@@ -83,6 +84,7 @@ write_env_snapshot() {
     echo "gpus=${GPUS_CSV}"
     echo "conda_env=${CONDA_ENV}"
     echo "smoke=${SMOKE}"
+    echo "auto_resume=${AUTO_RESUME}"
     echo
     nvidia-smi || true
     echo
@@ -96,10 +98,32 @@ PY
   } > "${out_dir}/env_info.txt"
 }
 
+find_resume_dir() {
+  local seed="$1"
+  find data/outputs -maxdepth 2 -type d -name "seed_${seed}" 2>/dev/null \
+    | while read -r candidate; do
+        if [[ -f "${candidate}/checkpoints/latest.ckpt" ]]; then
+          printf '%s\n' "${candidate}"
+        fi
+      done \
+    | sort \
+    | tail -n 1
+}
+
 launch_one() {
   local seed="$1"
   local gpu="$2"
   local run_dir="${RUN_ROOT}/seed_${seed}"
+
+  if [[ "${AUTO_RESUME}" == "1" ]]; then
+    local resume_dir
+    resume_dir="$(find_resume_dir "${seed}" || true)"
+    if [[ -n "${resume_dir}" ]]; then
+      run_dir="${resume_dir}"
+      log "Auto-resuming seed ${seed} from ${run_dir}"
+    fi
+  fi
+
   mkdir -p "${run_dir}"
 
   local overrides=(
@@ -126,6 +150,10 @@ launch_one() {
 
   log "Launching seed ${seed} on physical GPU ${gpu}; output ${run_dir}"
   if command -v tmux >/dev/null 2>&1; then
+    if tmux has-session -t "dp_pusht_s${seed}" 2>/dev/null; then
+      echo "tmux session dp_pusht_s${seed} already exists; attach with: tmux attach -t dp_pusht_s${seed}" >&2
+      return
+    fi
     tmux new-session -d -s "dp_pusht_s${seed}" "cd '${REPO_ROOT}' && ${cmd}"
     echo "tmux: dp_pusht_s${seed}" > "${run_dir}/launcher.txt"
   else

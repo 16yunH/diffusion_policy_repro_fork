@@ -147,6 +147,17 @@ conda activate robodiff
 GPUS=1,3,4 SEEDS=42,43,44 bash repro/launch_pusht_image_train3.sh
 ```
 
+The launcher auto-resumes from the newest existing
+`data/outputs/**/seed_<seed>/checkpoints/latest.ckpt` by default. To resume the
+previous three interrupted seeds on currently idle GPUs 1, 2, and 3:
+
+```bash
+conda activate robodiff
+GPUS=1,2,3 SEEDS=42,43,44 bash repro/launch_pusht_image_train3.sh
+```
+
+Set `AUTO_RESUME=0` only when intentionally starting a fresh run root.
+
 For a short smoke test first:
 
 ```bash
