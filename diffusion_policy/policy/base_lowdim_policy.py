@@ -7,7 +7,7 @@ from diffusion_policy.model.common.normalizer import LinearNormalizer
 class BaseLowdimPolicy(ModuleAttrMixin):  
     # ========= inference  ============
     # also as self.device and self.dtype for inference device transfer
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         """
         obs_dict:
             obs: B,To,Do

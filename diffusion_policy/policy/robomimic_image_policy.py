@@ -92,7 +92,7 @@ class RobomimicImagePolicy(BaseImagePolicy):
         super().to(*args,**kwargs)
     
     # =========== inference =============
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         nobs_dict = self.normalizer(obs_dict)
         robomimic_obs_dict = dict_apply(nobs_dict, lambda x: x[:,0,...])
         naction = self.model.get_action(robomimic_obs_dict)

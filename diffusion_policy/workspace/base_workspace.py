@@ -7,6 +7,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 import dill
 import torch
+import torch.nn as nn
 import threading
 
 
@@ -56,10 +57,15 @@ class BaseWorkspace:
             if hasattr(value, 'state_dict') and hasattr(value, 'load_state_dict'):
                 # modules, optimizers and samplers etc
                 if key not in exclude_keys:
-                    if use_thread:
-                        payload['state_dicts'][key] = _copy_to_cpu(value.state_dict())
+                    # Unwrap DDP to save the underlying model for portability
+                    if isinstance(value, nn.parallel.DistributedDataParallel):
+                        sd = value.module.state_dict()
                     else:
-                        payload['state_dicts'][key] = value.state_dict()
+                        sd = value.state_dict()
+                    if use_thread:
+                        payload['state_dicts'][key] = _copy_to_cpu(sd)
+                    else:
+                        payload['state_dicts'][key] = sd
             elif key in include_keys:
                 payload['pickles'][key] = dill.dumps(value)
         if use_thread:
@@ -81,7 +87,11 @@ class BaseWorkspace:
 
         for key, value in payload['state_dicts'].items():
             if key not in exclude_keys:
-                self.__dict__[key].load_state_dict(value, **kwargs)
+                target = self.__dict__[key]
+                if isinstance(target, nn.parallel.DistributedDataParallel):
+                    target.module.load_state_dict(value, **kwargs)
+                else:
+                    target.load_state_dict(value, **kwargs)
         for key in include_keys:
             if key in payload['pickles']:
                 self.__dict__[key] = dill.loads(payload['pickles'][key])

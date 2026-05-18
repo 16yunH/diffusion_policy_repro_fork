@@ -97,10 +97,13 @@ training:
   seed: 42
   debug: False
   resume: True
+  # DDP (DistributedDataParallel) — enabled via torchrun launcher
+  ddp: false
+  find_unused_parameters: false
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 8000
+  num_epochs: 3050
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm
   # replace BatchNorm with GroupNorm.
@@ -112,6 +115,10 @@ training:
   checkpoint_every: 50
   val_every: 1
   sample_every: 5
+  # early stopping
+  early_stop_patience: 0            # 0 = disabled; N = stop after N epochs without improvement
+  early_stop_min_delta: 0.005       # minimum improvement to reset patience counter
+  early_stop_metric: "test/mean_score"
   # steps per epoch
   max_train_steps: null
   max_val_steps: null

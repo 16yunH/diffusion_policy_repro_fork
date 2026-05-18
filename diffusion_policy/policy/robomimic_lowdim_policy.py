@@ -51,7 +51,7 @@ class RobomimicLowdimPolicy(BaseLowdimPolicy):
         super().to(*args,**kwargs)
     
     # =========== inference =============
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         obs = self.normalizer['obs'].normalize(obs_dict['obs'])
         assert obs.shape[1] == 1
         robomimic_obs_dict = {self.obs_key: obs[:,0,:]}

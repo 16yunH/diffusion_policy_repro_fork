@@ -29,7 +29,7 @@ class BETLowdimPolicy(BaseLowdimPolicy):
         self.n_obs_steps = n_obs_steps
 
     # ========= inference  ============
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor], **kwargs) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key

@@ -28,17 +28,22 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.common.ddp_util import (
+    init_ddp, is_ddp_enabled, get_rank, get_world_size,
+    is_main_process, get_device, wrap_ddp, get_ddp_model,
+    prepare_dataloader
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', '_best_score', '_best_epoch', '_no_improve_count']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
         # set seed
-        seed = cfg.training.seed
+        seed = cfg.training.seed + get_rank()
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
@@ -50,7 +55,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
 
-        # configure training state
+        # configure optimizer
         self.optimizer = hydra.utils.instantiate(
             cfg.optimizer, params=self.model.parameters())
 
@@ -58,8 +63,14 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
+        # early stopping state
+        self._best_score = -float('inf')
+        self._best_epoch = 0
+        self._no_improve_count = 0
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        ddp_enabled = cfg.training.get('ddp', False)
 
         # resume training
         if cfg.training.resume:
@@ -72,12 +83,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        train_dataloader = prepare_dataloader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        val_dataloader = prepare_dataloader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -103,37 +114,47 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        # configure env (rank 0 only)
+        env_runner: BaseImageRunner = None
+        if is_main_process():
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, BaseImageRunner)
 
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
+        # configure logging (rank 0 only)
+        wandb_run = None
+        if is_main_process():
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir,
+                }
+            )
 
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
+        # configure checkpoint (rank 0 only)
+        topk_manager = None
+        if is_main_process():
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
 
         # device transfer
-        device = torch.device(cfg.training.device)
+        device = get_device(cfg.training.device)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+
+        # wrap model with DDP
+        if ddp_enabled:
+            self.model = wrap_ddp(self.model,
+                find_unused_parameters=cfg.training.get('find_unused_parameters', False))
 
         # save batch for sampling
         train_sampling_batch = None
@@ -154,7 +175,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 train_losses = list()
-                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
+                with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}",
                         leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                     for batch_idx, batch in enumerate(tepoch):
                         # device transfer
@@ -163,19 +184,28 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        model_for_loss = self.model.module if ddp_enabled else self.model
+                        raw_loss = model_for_loss.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+
+                        is_last_accum = (
+                            self.global_step % cfg.training.gradient_accumulate_every ==
+                            (cfg.training.gradient_accumulate_every - 1))
+                        if ddp_enabled and not is_last_accum:
+                            with self.model.no_sync():
+                                loss.backward()
+                        else:
+                            loss.backward()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
+
                         # update ema
                         if cfg.training.use_ema:
-                            ema.step(self.model)
+                            ema.step(self.model.module if ddp_enabled else self.model)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -191,7 +221,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log, step=self.global_step)
+                            if wandb_run is not None:
+                                wandb_run.log(step_log, step=self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
 
@@ -210,8 +241,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     policy = self.ema_model
                 policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                # run rollout (rank 0 only)
+                if (self.epoch % cfg.training.rollout_every) == 0 and is_main_process():
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
@@ -220,11 +251,12 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                        eval_model = self.model.module if ddp_enabled else self.model
+                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
+                                loss = eval_model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -234,14 +266,14 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                # run diffusion sampling on a training batch (rank 0 only)
+                if (self.epoch % cfg.training.sample_every) == 0 and is_main_process():
                     with torch.no_grad():
                         # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
+
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
@@ -252,9 +284,24 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         del result
                         del pred_action
                         del mse
-                
-                # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
+
+                # early stopping
+                if cfg.training.get('early_stop_patience', 0) > 0 and is_main_process():
+                    current_score = step_log.get(cfg.training.early_stop_metric)
+                    if current_score is not None:
+                        if current_score > self._best_score + cfg.training.early_stop_min_delta:
+                            self._best_score = current_score
+                            self._best_epoch = self.epoch
+                            self._no_improve_count = 0
+                        else:
+                            self._no_improve_count += 1
+                        if self._no_improve_count >= cfg.training.early_stop_patience:
+                            print(f"Early stopping at epoch {self.epoch}, "
+                                  f"best score {self._best_score:.4f} at epoch {self._best_epoch}")
+                            break
+
+                # checkpoint (rank 0 only)
+                if (self.epoch % cfg.training.checkpoint_every) == 0 and is_main_process():
                     # checkpointing
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
@@ -266,7 +313,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                     for key, value in step_log.items():
                         new_key = key.replace('/', '_')
                         metric_dict[new_key] = value
-                    
+
                     # We can't copy the last checkpoint here
                     # since save_checkpoint uses threads.
                     # therefore at this point the file might have been empty!
@@ -279,7 +326,8 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
 
                 # end of epoch
                 # log of last step is combined with validation and rollout
-                wandb_run.log(step_log, step=self.global_step)
+                if wandb_run is not None:
+                    wandb_run.log(step_log, step=self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1

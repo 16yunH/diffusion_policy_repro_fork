@@ -28,17 +28,21 @@ from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply, optimizer_to
 from diffusion_policy.model.diffusion.ema_model import EMAModel
 from diffusion_policy.model.common.lr_scheduler import get_scheduler
+from diffusion_policy.common.ddp_util import (
+    is_ddp_enabled, get_rank, get_world_size, is_main_process,
+    wrap_ddp, get_ddp_model, prepare_dataloader, get_device,
+)
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
-    include_keys = ['global_step', 'epoch']
+    include_keys = ['global_step', 'epoch', '_best_score', '_best_epoch', '_no_improve_count']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
         super().__init__(cfg, output_dir=output_dir)
 
-        # set seed
-        seed = cfg.training.seed
+        # set seed (offset by rank in DDP mode so each process has different shuffle)
+        seed = cfg.training.seed + get_rank()
         torch.manual_seed(seed)
         np.random.seed(seed)
         random.seed(seed)
@@ -58,8 +62,14 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         self.global_step = 0
         self.epoch = 0
 
+        # early stopping state
+        self._best_score = -float('inf')
+        self._best_epoch = 0
+        self._no_improve_count = 0
+
     def run(self):
         cfg = copy.deepcopy(self.cfg)
+        ddp_enabled = cfg.training.get('ddp', False)
 
         # resume training
         if cfg.training.resume:
@@ -72,12 +82,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         dataset: BaseImageDataset
         dataset = hydra.utils.instantiate(cfg.task.dataset)
         assert isinstance(dataset, BaseImageDataset)
-        train_dataloader = DataLoader(dataset, **cfg.dataloader)
+        train_dataloader = prepare_dataloader(dataset, **cfg.dataloader)
         normalizer = dataset.get_normalizer()
 
         # configure validation dataset
         val_dataset = dataset.get_validation_dataset()
-        val_dataloader = DataLoader(val_dataset, **cfg.val_dataloader)
+        val_dataloader = prepare_dataloader(val_dataset, **cfg.val_dataloader)
 
         self.model.set_normalizer(normalizer)
         if cfg.training.use_ema:
@@ -103,37 +113,49 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 cfg.ema,
                 model=self.ema_model)
 
-        # configure env
-        env_runner: BaseImageRunner
-        env_runner = hydra.utils.instantiate(
-            cfg.task.env_runner,
-            output_dir=self.output_dir)
-        assert isinstance(env_runner, BaseImageRunner)
+        # configure env (rank 0 only — env runner is not distributable)
+        env_runner: BaseImageRunner = None
+        if is_main_process():
+            env_runner = hydra.utils.instantiate(
+                cfg.task.env_runner,
+                output_dir=self.output_dir)
+            assert isinstance(env_runner, BaseImageRunner)
 
-        # configure logging
-        wandb_run = wandb.init(
-            dir=str(self.output_dir),
-            config=OmegaConf.to_container(cfg, resolve=True),
-            **cfg.logging
-        )
-        wandb.config.update(
-            {
-                "output_dir": self.output_dir,
-            }
-        )
+        # configure logging (rank 0 only)
+        wandb_run = None
+        if is_main_process():
+            wandb_run = wandb.init(
+                dir=str(self.output_dir),
+                config=OmegaConf.to_container(cfg, resolve=True),
+                **cfg.logging
+            )
+            wandb.config.update(
+                {
+                    "output_dir": self.output_dir,
+                }
+            )
 
-        # configure checkpoint
-        topk_manager = TopKCheckpointManager(
-            save_dir=os.path.join(self.output_dir, 'checkpoints'),
-            **cfg.checkpoint.topk
-        )
+        # configure checkpoint (rank 0 only)
+        topk_manager = None
+        if is_main_process():
+            topk_manager = TopKCheckpointManager(
+                save_dir=os.path.join(self.output_dir, 'checkpoints'),
+                **cfg.checkpoint.topk
+            )
 
-        # device transfer
-        device = torch.device(cfg.training.device)
+        # device transfer (use DDP-aware device when DDP enabled)
+        device = get_device(cfg.training.device)
         self.model.to(device)
         if self.ema_model is not None:
             self.ema_model.to(device)
         optimizer_to(self.optimizer, device)
+
+        # DDP: wrap model after device transfer
+        if cfg.training.get('ddp', False):
+            self.model = wrap_ddp(self.model,
+                find_unused_parameters=cfg.training.get('find_unused_parameters', False))
+            if get_rank() == 0:
+                print(f"[DDP] Model wrapped. World size: {get_world_size()}")
 
         # save batch for sampling
         train_sampling_batch = None
@@ -154,8 +176,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
-                    self.model.obs_encoder.eval()
-                    self.model.obs_encoder.requires_grad_(False)
+                    encoder = self.model.module.obs_encoder if ddp_enabled else self.model.obs_encoder
+                    encoder.eval()
+                    encoder.requires_grad_(False)
 
                 train_losses = list()
                 with tqdm.tqdm(train_dataloader, desc=f"Training epoch {self.epoch}", 
@@ -166,20 +189,33 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
-                        # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        # compute loss (use .module for custom methods when DDP-wrapped)
+                        model_for_loss = self.model.module if ddp_enabled else self.model
+                        raw_loss = model_for_loss.compute_loss(batch)
                         loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+
+                        # DDP: suppress gradient sync on intermediate accumulation steps
+                        is_last_accum = (
+                            (self.global_step + 1) % cfg.training.gradient_accumulate_every == 0
+                        )
+                        if ddp_enabled and not is_last_accum:
+                            with self.model.no_sync():
+                                loss.backward()
+                        else:
+                            loss.backward()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
-                        
+
                         # update ema
                         if cfg.training.use_ema:
-                            ema.step(self.model)
+                            if ddp_enabled:
+                                ema.step(self.model.module)
+                            else:
+                                ema.step(self.model)
 
                         # logging
                         raw_loss_cpu = raw_loss.item()
@@ -195,7 +231,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
                         if not is_last_batch:
                             # log of last step is combined with validation and rollout
-                            wandb_run.log(step_log, step=self.global_step)
+                            if wandb_run is not None:
+                                wandb_run.log(step_log, step=self.global_step)
                             json_logger.log(step_log)
                             self.global_step += 1
 
@@ -209,43 +246,48 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
+                # Use EMA model for eval (never DDP-wrapped). When no EMA,
+                # unwrap DDP if needed since predict_action uses self.device.
                 policy = self.model
                 if cfg.training.use_ema:
                     policy = self.ema_model
+                elif ddp_enabled:
+                    policy = self.model.module
                 policy.eval()
 
-                # run rollout
-                if (self.epoch % cfg.training.rollout_every) == 0:
+                # model with custom method access (unwrapped when DDP)
+                eval_model = self.model.module if ddp_enabled else self.model
+
+                # run rollout (rank 0 only)
+                if is_main_process() and env_runner is not None \
+                        and (self.epoch % cfg.training.rollout_every) == 0:
                     runner_log = env_runner.run(policy)
-                    # log all
                     step_log.update(runner_log)
 
-                # run validation
-                if (self.epoch % cfg.training.val_every) == 0:
+                # run validation (rank 0 only for simplicity)
+                if is_main_process() and (self.epoch % cfg.training.val_every) == 0:
                     with torch.no_grad():
                         val_losses = list()
-                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
+                        with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
+                                loss = eval_model.compute_loss(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
                             step_log['val_loss'] = val_loss
 
-                # run diffusion sampling on a training batch
-                if (self.epoch % cfg.training.sample_every) == 0:
+                # run diffusion sampling on a training batch (rank 0 only)
+                if is_main_process() and (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
-                        # sample trajectory from training set, and evaluate difference
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
+
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
@@ -256,10 +298,33 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         del result
                         del pred_action
                         del mse
-                
-                # checkpoint
-                if (self.epoch % cfg.training.checkpoint_every) == 0:
-                    # checkpointing
+
+                # early stopping (rank 0 only, after rollout which sets test/mean_score)
+                if is_main_process() and cfg.training.early_stop_patience > 0:
+                    current_score = step_log.get(cfg.training.early_stop_metric)
+                    if current_score is not None:
+                        if current_score > self._best_score + cfg.training.early_stop_min_delta:
+                            self._best_score = current_score
+                            self._best_epoch = self.epoch
+                            self._no_improve_count = 0
+                        else:
+                            self._no_improve_count += 1
+                        if self._no_improve_count >= cfg.training.early_stop_patience:
+                            print(
+                                f"[EarlyStop] epoch {self.epoch}: no improvement for "
+                                f"{self._no_improve_count} epochs. "
+                                f"Best {cfg.training.early_stop_metric}={self._best_score:.4f} "
+                                f"at epoch {self._best_epoch}."
+                            )
+                            self.epoch += 1
+                            # save final checkpoint before exiting
+                            if topk_manager is not None and cfg.checkpoint.save_last_ckpt:
+                                self.save_checkpoint()
+                            break
+
+                # checkpoint (rank 0 only)
+                if is_main_process() and topk_manager is not None \
+                        and (self.epoch % cfg.training.checkpoint_every) == 0:
                     if cfg.checkpoint.save_last_ckpt:
                         self.save_checkpoint()
                     if cfg.checkpoint.save_last_snapshot:
@@ -270,20 +335,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     for key, value in step_log.items():
                         new_key = key.replace('/', '_')
                         metric_dict[new_key] = value
-                    
-                    # We can't copy the last checkpoint here
-                    # since save_checkpoint uses threads.
-                    # therefore at this point the file might have been empty!
+
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
                     if topk_ckpt_path is not None:
                         self.save_checkpoint(path=topk_ckpt_path)
                 # ========= eval end for this epoch ==========
                 policy.train()
+                self.model.train()
 
                 # end of epoch
-                # log of last step is combined with validation and rollout
-                wandb_run.log(step_log, step=self.global_step)
+                if wandb_run is not None:
+                    wandb_run.log(step_log, step=self.global_step)
                 json_logger.log(step_log)
                 self.global_step += 1
                 self.epoch += 1

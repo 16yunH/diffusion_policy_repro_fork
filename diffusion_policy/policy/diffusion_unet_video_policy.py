@@ -173,7 +173,8 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
         return trajectory
 
 
-    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor],
+                       generator=None) -> Dict[str, torch.Tensor]:
         """
         obs_dict: must include "obs" key
         result: must include "action" key
@@ -219,10 +220,11 @@ class DiffusionUnetVideoPolicy(BaseImagePolicy):
 
         # run sampling
         nsample = self.conditional_sample(
-            cond_data, 
+            cond_data,
             cond_mask,
             local_cond=None,
             global_cond=global_cond,
+            generator=generator,
             **self.kwargs)
         
         # unnormalize prediction

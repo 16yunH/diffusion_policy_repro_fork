@@ -146,6 +146,7 @@ class PushTImageRunner(BaseImageRunner):
         device = policy.device
         dtype = policy.dtype
         env = self.env
+        eval_generator = torch.Generator(device=device).manual_seed(0)
 
         # plan for rollout
         n_envs = len(self.env_fns)
@@ -196,7 +197,7 @@ class PushTImageRunner(BaseImageRunner):
 
                 # run policy
                 with torch.no_grad():
-                    action_dict = policy.predict_action(obs_dict)
+                    action_dict = policy.predict_action(obs_dict, generator=eval_generator)
 
                 # device_transfer
                 np_action_dict = dict_apply(action_dict,
