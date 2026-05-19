@@ -285,7 +285,7 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                         del pred_action
                         del mse
 
-                # early stopping
+                # early stopping — check every epoch, using the latest available metric
                 if cfg.training.get('early_stop_patience', 0) > 0 and is_main_process():
                     current_score = step_log.get(cfg.training.early_stop_metric)
                     if current_score is not None:
@@ -295,10 +295,13 @@ class TrainDiffusionUnetHybridWorkspace(BaseWorkspace):
                             self._no_improve_count = 0
                         else:
                             self._no_improve_count += 1
-                        if self._no_improve_count >= cfg.training.early_stop_patience:
-                            print(f"Early stopping at epoch {self.epoch}, "
-                                  f"best score {self._best_score:.4f} at epoch {self._best_epoch}")
-                            break
+                    elif self._best_score > -float('inf'):
+                        # no rollout this epoch, but we have a previous best — count as no-improvement
+                        self._no_improve_count += 1
+                    if self._no_improve_count >= cfg.training.early_stop_patience:
+                        print(f"Early stopping at epoch {self.epoch}, "
+                              f"best score {self._best_score:.4f} at epoch {self._best_epoch}")
+                        break
 
                 # checkpoint (rank 0 only)
                 if (self.epoch % cfg.training.checkpoint_every) == 0 and is_main_process():

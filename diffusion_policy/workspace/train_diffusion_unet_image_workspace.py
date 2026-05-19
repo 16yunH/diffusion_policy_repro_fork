@@ -299,7 +299,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         del pred_action
                         del mse
 
-                # early stopping (rank 0 only, after rollout which sets test/mean_score)
+                # early stopping — check every epoch, using the latest available metric
                 if is_main_process() and cfg.training.early_stop_patience > 0:
                     current_score = step_log.get(cfg.training.early_stop_metric)
                     if current_score is not None:
@@ -309,18 +309,20 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             self._no_improve_count = 0
                         else:
                             self._no_improve_count += 1
-                        if self._no_improve_count >= cfg.training.early_stop_patience:
-                            print(
-                                f"[EarlyStop] epoch {self.epoch}: no improvement for "
-                                f"{self._no_improve_count} epochs. "
-                                f"Best {cfg.training.early_stop_metric}={self._best_score:.4f} "
-                                f"at epoch {self._best_epoch}."
-                            )
-                            self.epoch += 1
-                            # save final checkpoint before exiting
-                            if topk_manager is not None and cfg.checkpoint.save_last_ckpt:
-                                self.save_checkpoint()
-                            break
+                    elif self._best_score > -float('inf'):
+                        self._no_improve_count += 1
+                    if self._no_improve_count >= cfg.training.early_stop_patience:
+                        print(
+                            f"[EarlyStop] epoch {self.epoch}: no improvement for "
+                            f"{self._no_improve_count} epochs. "
+                            f"Best {cfg.training.early_stop_metric}={self._best_score:.4f} "
+                            f"at epoch {self._best_epoch}."
+                        )
+                        self.epoch += 1
+                        # save final checkpoint before exiting
+                        if topk_manager is not None and cfg.checkpoint.save_last_ckpt:
+                            self.save_checkpoint()
+                        break
 
                 # checkpoint (rank 0 only)
                 if is_main_process() and topk_manager is not None \
